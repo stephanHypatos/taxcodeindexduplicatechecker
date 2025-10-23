@@ -5,93 +5,80 @@ import streamlit as st
 st.set_page_config(page_title="Excel-Duplikate prüfen & bereinigen", layout="wide")
 
 st.title("Excel-Duplikate prüfen & bereinigen")
-st.write(
-    """
-Lade eine **Excel-Datei (.xlsx)** mit den Spalten (z. B.)  
-`externalId, code, taxExemption, name, recipientCountry, category, vendorCountry, itemsTaxRate, Column1` hoch.
+
+st.write("""
+Lade eine **Excel-Datei (.xlsx)** mit Spalten wie  
+`externalId, code, taxExemption, name, recipientCountry, category, vendorCountry, itemsTaxRate, Column1`.
 
 **Logik:** Zeilen gelten als Duplikate, wenn **alle Spalten außer `externalId` identisch** sind.  
-Beim Bereinigen bleibt **nur die Zeile mit der kleinsten `externalId`** pro Duplikat-Gruppe erhalten.
-"""
-)
+Die App markiert diese Zeilen und exportiert eine bereinigte Datei, in der **nur eine Zeile pro Gruppe** bleibt
+(standardmäßig die mit der kleinsten `externalId`, wobei führende Nullen beibehalten werden).
+""")
 
-# ---------- Helper ----------
-def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Trimmt Strings, normalisiert leere Strings auf NaN, lässt andere Typen unverändert."""
-    df = df.copy()
-    for col in df.columns:
-        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-            # strip whitespaces
-            df[col] = df[col].astype(str).str.strip()
-            # convert empty strings to NA
-            df[col] = df[col].replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+# -------------------------------
+# Helper-Funktionen
+# -------------------------------
+
+def read_excel_as_str(file) -> pd.DataFrame:
+    """Liest Excel ein, behält führende Nullen in externalId."""
+    df = pd.read_excel(file, dtype=str)
+    df = df.fillna("")  # Leere Zellen zu leeren Strings
+    # Alle Spalten trimmen
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
-def to_numeric_safe(s: pd.Series):
-    """Konvertiert externalId bestmöglich numerisch, um korrekt die kleinste ID zu bestimmen.
-    Fällt zurück auf String-Vergleich, wenn nicht numerisch."""
-    num = pd.to_numeric(s, errors="coerce")
-    if num.notna().any():
-        # Fülle NaN mit +inf, damit echte Zahlen bevorzugt klein sind
-        return num.fillna(float("inf"))
-    # rein lexikografisch vergleichen, falls alles nicht-numerisch
-    return s.astype(str)
-
-def find_duplicates_and_clean(df: pd.DataFrame, id_col: str = "externalId"):
+def find_duplicates_and_clean(df: pd.DataFrame, id_col="externalId"):
     if id_col not in df.columns:
         raise ValueError(f"Spalte '{id_col}' fehlt in der Datei.")
 
-    # Normalisieren (optional, aber sehr nützlich)
-    df_norm = normalize_dataframe(df)
+    # Spalten für Vergleich
+    compare_cols = [c for c in df.columns if c != id_col]
 
-    # Spalten, nach denen Duplikate definiert werden (alle außer externalId)
-    key_cols = [c for c in df_norm.columns if c != id_col]
-    if not key_cols:
-        raise ValueError("Es gibt keine Vergleichsspalten außer 'externalId'.")
+    # Duplikate finden (nach allen anderen Spalten)
+    dup_mask = df.duplicated(subset=compare_cols, keep=False)
 
-    # Maske: alle Zeilen, die zu einer Duplikat-Gruppe gehören (>=2 gleich)
-    dup_mask = df_norm.duplicated(subset=key_cols, keep=False)
+    # Nur Duplikate anzeigen
+    duplicates_df = df.loc[dup_mask].copy()
 
-    duplicates_df = df_norm.loc[dup_mask].copy()
+    # Für jede Gruppe nur kleinste externalId (stringvergleich, behält führende 0)
+    cleaned_df = (
+        df.sort_values(by=[*compare_cols, id_col], kind="mergesort")
+        .drop_duplicates(subset=compare_cols, keep="first")
+        .reset_index(drop=True)
+    )
 
-    # Bereinigung: je Gruppe die kleinste externalId (numerisch bevorzugt) behalten
-    df_for_sort = df_norm.copy()
-    df_for_sort["_externalId_sort"] = to_numeric_safe(df_for_sort[id_col])
-
-    # Drop duplicates by key_cols, keeping the first after sorting by keys + _externalId_sort + externalId
-    df_for_sort = df_for_sort.sort_values(key_cols + ["_externalId_sort", id_col], kind="mergesort")
-    cleaned_df = df_for_sort.drop_duplicates(subset=key_cols, keep="first").drop(columns=["_externalId_sort"])
-
-    # Statistiken
-    removed_count = len(df_norm) - len(cleaned_df)
+    removed_count = len(df) - len(cleaned_df)
     group_count = (
-        duplicates_df[key_cols]
-        .drop_duplicates()
-        .shape[0]
+        duplicates_df[compare_cols].drop_duplicates().shape[0]
         if not duplicates_df.empty
         else 0
     )
 
-    return duplicates_df, cleaned_df, removed_count, group_count
+    return duplicates_df, cleaned_df, removed_count, group_count, dup_mask
 
-def df_to_excel_download(df: pd.DataFrame, sheet_name: str = "bereinigt") -> bytes:
+def highlight_duplicates(df: pd.DataFrame, dup_mask):
+    """Markiert Duplikate farblich (orange)."""
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    styles.loc[dup_mask, :] = "background-color: #ffd6cc"  # hellrot
+    return styles
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Exportiert DataFrame zu Excel Bytes."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        df.to_excel(writer, index=False, sheet_name="Bereinigt")
     return buffer.getvalue()
 
-# ---------- UI ----------
-uploaded = st.file_uploader("Excel-Datei hochladen (.xlsx)", type=["xlsx"])
 
-with st.expander("Optionen"):
-    keep_original_order = st.checkbox(
-        "Original-Reihenfolge im Export erhalten (statt nach Gruppen/IDs sortiert)",
-        value=False,
-    )
+# -------------------------------
+# UI
+# -------------------------------
+
+uploaded = st.file_uploader("Excel-Datei hochladen (.xlsx)", type=["xlsx"])
 
 if uploaded:
     try:
-        df_input = pd.read_excel(uploaded)
+        df_input = read_excel_as_str(uploaded)
     except Exception as e:
         st.error(f"Fehler beim Laden der Datei: {e}")
         st.stop()
@@ -101,48 +88,33 @@ if uploaded:
 
     if st.button("Duplikate prüfen & bereinigen"):
         try:
-            duplicates_df, cleaned_df, removed_count, group_count = find_duplicates_and_clean(df_input, id_col="externalId")
+            duplicates_df, cleaned_df, removed_count, group_count, dup_mask = find_duplicates_and_clean(df_input)
 
             st.success(
-                f"Ergebnis: {removed_count} Zeile(n) entfernt in {group_count} Duplikat-Gruppe(n)."
+                f"{removed_count} Zeile(n) entfernt in {group_count} Duplikat-Gruppe(n)."
             )
 
             if duplicates_df.empty:
-                st.info("Keine Duplikate gefunden (nach Regel: alle Spalten außer 'externalId' identisch).")
+                st.info("Keine Duplikate gefunden.")
             else:
-                st.subheader("Gefundene Duplikate")
-                # Zur leichteren Sichtbarkeit sortieren wir die Duplikate nach den Key-Spalten + externalId
-                key_cols = [c for c in duplicates_df.columns if c != "externalId"]
-                show_dups = duplicates_df.sort_values(key_cols + ["externalId"], kind="mergesort")
-                st.dataframe(show_dups, use_container_width=True)
-
-            # Export vorbereiten
-            if keep_original_order:
-                # Reihenfolge wie im Input beibehalten -> Reindex nach Originalindex
-                cleaned_df = df_input.merge(
-                    cleaned_df.assign(_keep=1),
-                    how="inner",
-                    on=list(cleaned_df.columns),
-                ).drop(columns=["_keep"])
-                # Falls obiger Merge wegen identischer Spalten schwierig: alternativ per Key-Vergleichsbasis neu sortieren
-            else:
-                # Sinnvolle Default-Sortierung: nach Vergleichsschlüsseln + externalId
-                sort_cols = [c for c in cleaned_df.columns if c != "externalId"] + ["externalId"]
-                cleaned_df = cleaned_df.sort_values(sort_cols, kind="mergesort")
+                st.subheader("Gefundene Duplikate (farblich markiert)")
+                st.dataframe(
+                    df_input.style.apply(lambda _: highlight_duplicates(df_input, dup_mask), axis=None),
+                    use_container_width=True,
+                )
 
             st.subheader("Bereinigte Tabelle (Export-Vorschau)")
             st.dataframe(cleaned_df, use_container_width=True)
 
-            xlsx_bytes = df_to_excel_download(cleaned_df, sheet_name="bereinigt")
+            excel_data = df_to_excel_bytes(cleaned_df)
             st.download_button(
                 label="Bereinigte Excel herunterladen (.xlsx)",
-                data=xlsx_bytes,
+                data=excel_data,
                 file_name="bereinigt_ohne_duplikate.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
         except Exception as e:
             st.error(f"Fehler bei der Verarbeitung: {e}")
-
 else:
-    st.info("Bitte eine .xlsx-Datei hochladen, um zu starten.")
+    st.info("Bitte eine Excel-Datei (.xlsx) hochladen, um zu starten.")
