@@ -5,69 +5,73 @@ import streamlit as st
 st.set_page_config(page_title="Excel-Duplikate prüfen & bereinigen", layout="wide")
 
 st.title("Excel-Duplikate prüfen & bereinigen")
-
 st.write("""
-Lade eine **Excel-Datei (.xlsx)** mit Spalten wie  
-`externalId, code, taxExemption, name, recipientCountry, category, vendorCountry, itemsTaxRate, Column1`.
+Lade eine **Excel-Datei (.xlsx)** hoch. Duplikate sind Zeilen, bei denen **alle Spalten außer `externalId`** identisch sind.  
+Führende Nullen in `externalId` bleiben erhalten (wird als String gelesen).
 
-**Logik:** Zeilen gelten als Duplikate, wenn **alle Spalten außer `externalId` identisch** sind.  
-Die App markiert diese Zeilen und exportiert eine bereinigte Datei, in der **nur eine Zeile pro Gruppe** bleibt
-(standardmäßig die mit der kleinsten `externalId`, wobei führende Nullen beibehalten werden).
+**Downloads am Ende:**
+1) Bereinigte Excel ohne Duplikate  
+2) Datei mit den **entfernten `externalId`s**
 """)
 
 # -------------------------------
-# Helper-Funktionen
+# Helpers
 # -------------------------------
 
 def read_excel_as_str(file) -> pd.DataFrame:
-    """Liest Excel ein, behält führende Nullen in externalId."""
+    """Liest Excel ein, behält führende Nullen (dtype=str) in allen Spalten."""
     df = pd.read_excel(file, dtype=str)
-    df = df.fillna("")  # Leere Zellen zu leeren Strings
-    # Alle Spalten trimmen
+    df = df.fillna("")
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
-def find_duplicates_and_clean(df: pd.DataFrame, id_col="externalId"):
-    if id_col not in df.columns:
-        raise ValueError(f"Spalte '{id_col}' fehlt in der Datei.")
+def highlight_duplicates(df: pd.DataFrame, dup_mask):
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    styles.loc[dup_mask, :] = "background-color: #ffd6cc"  # hellrot/orange
+    return styles
 
-    # Spalten für Vergleich
+def to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buffer.getvalue()
+
+def find_duplicates_and_outputs(df: pd.DataFrame, id_col="externalId"):
+    if id_col not in df.columns:
+        raise ValueError(f"Spalte '{id_col}' fehlt.")
+
     compare_cols = [c for c in df.columns if c != id_col]
 
-    # Duplikate finden (nach allen anderen Spalten)
+    # Duplikate nach Vergleichsspalten
     dup_mask = df.duplicated(subset=compare_cols, keep=False)
 
-    # Nur Duplikate anzeigen
-    duplicates_df = df.loc[dup_mask].copy()
+    # Stabil sortieren: erst nach Vergleichsschlüsseln, dann externalId (als String, behält führende Nullen)
+    df_sorted = df.copy()
+    df_sorted["_orig_idx"] = range(len(df_sorted))
+    df_sorted = df_sorted.sort_values(by=[*compare_cols, id_col], kind="mergesort")
 
-    # Für jede Gruppe nur kleinste externalId (stringvergleich, behält führende 0)
-    cleaned_df = (
-        df.sort_values(by=[*compare_cols, id_col], kind="mergesort")
-        .drop_duplicates(subset=compare_cols, keep="first")
+    # In jeder Gruppe (compare_cols) die erste Zeile behalten
+    df_sorted["_keep"] = ~df_sorted.duplicated(subset=compare_cols, keep="first")
+
+    # Bereinigte Tabelle = nur _keep == True
+    cleaned_sorted = df_sorted[df_sorted["_keep"]].drop(columns=["_orig_idx", "_keep"])
+    cleaned_df = cleaned_sorted.reset_index(drop=True)
+
+    # Entfernte Zeilen = _keep == False
+    removed_rows_sorted = df_sorted[~df_sorted["_keep"]]
+    removed_ids_df = (
+        removed_rows_sorted[[id_col]]
+        .drop_duplicates()
         .reset_index(drop=True)
     )
 
-    removed_count = len(df) - len(cleaned_df)
+    removed_count = len(removed_rows_sorted)
     group_count = (
-        duplicates_df[compare_cols].drop_duplicates().shape[0]
-        if not duplicates_df.empty
-        else 0
+        df.loc[dup_mask, compare_cols].drop_duplicates().shape[0]
+        if dup_mask.any() else 0
     )
 
-    return duplicates_df, cleaned_df, removed_count, group_count, dup_mask
-
-def highlight_duplicates(df: pd.DataFrame, dup_mask):
-    """Markiert Duplikate farblich (orange)."""
-    styles = pd.DataFrame("", index=df.index, columns=df.columns)
-    styles.loc[dup_mask, :] = "background-color: #ffd6cc"  # hellrot
-    return styles
-
-def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Exportiert DataFrame zu Excel Bytes."""
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Bereinigt")
-    return buffer.getvalue()
+    return dup_mask, cleaned_df, removed_ids_df, removed_count, group_count
 
 
 # -------------------------------
@@ -88,14 +92,12 @@ if uploaded:
 
     if st.button("Duplikate prüfen & bereinigen"):
         try:
-            duplicates_df, cleaned_df, removed_count, group_count, dup_mask = find_duplicates_and_clean(df_input)
+            dup_mask, cleaned_df, removed_ids_df, removed_count, group_count = find_duplicates_and_outputs(df_input)
 
-            st.success(
-                f"{removed_count} Zeile(n) entfernt in {group_count} Duplikat-Gruppe(n)."
-            )
+            st.success(f"{removed_count} Zeile(n) entfernt in {group_count} Duplikat-Gruppe(n).")
 
-            if duplicates_df.empty:
-                st.info("Keine Duplikate gefunden.")
+            if not dup_mask.any():
+                st.info("Keine Duplikate gefunden (nach Regel: alle Spalten außer 'externalId' identisch).")
             else:
                 st.subheader("Gefundene Duplikate (farblich markiert)")
                 st.dataframe(
@@ -106,11 +108,20 @@ if uploaded:
             st.subheader("Bereinigte Tabelle (Export-Vorschau)")
             st.dataframe(cleaned_df, use_container_width=True)
 
-            excel_data = df_to_excel_bytes(cleaned_df)
+            # --- Downloads ---
+            cleaned_bytes = to_excel_bytes(cleaned_df, sheet_name="Bereinigt")
             st.download_button(
                 label="Bereinigte Excel herunterladen (.xlsx)",
-                data=excel_data,
+                data=cleaned_bytes,
                 file_name="bereinigt_ohne_duplikate.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            removed_bytes = to_excel_bytes(removed_ids_df, sheet_name="Entfernte_externalIds")
+            st.download_button(
+                label="Entfernte externalIds herunterladen (.xlsx)",
+                data=removed_bytes,
+                file_name="entfernte_externalIds.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
